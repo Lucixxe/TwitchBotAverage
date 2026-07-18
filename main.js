@@ -1,18 +1,16 @@
-const express = require('express');
 const tmi = require('tmi.js');
-const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Import Node's built-in HTTPS module to send the final results to Wizebot
-const https = require('https');
-
-// Safely retrieve the Twitch channel name from environment variables (default to 'lucixxe' if missing)
 const twitchChannel = process.env.TWITCH_CHANNEL || 'lucixxe';
+const oauthToken = process.env.TWITCH_OAUTH || 'oauth:TOKEN'; // Generate your OAuth token at https://twitchtokengenerator.com/
 
-// TMI.JS CONFIGURATION (Anonymous read-only connection, no password needed)
+// TMI.JS CONFIGURATION (Authenticated connection to read and write)
 const client = new tmi.Client({
     options: { debug: false },
-    channels: [ twitchChannel ] // Dynamically joins the channel defined in your environment variables
+    identity: {
+        username: twitchChannel,
+        password: oauthToken // Your generated OAuth token
+    },
+    channels: [ twitchChannel ]
 });
 client.connect().catch(console.error);
 
@@ -23,92 +21,123 @@ let votes = {}; // Stores votes in the format { 'username': score }
 
 // Listen to incoming messages in the Twitch chat
 client.on('message', (channel, tags, message, self) => {
-    if (!voteActif) return;
-    
-    const pseudo = tags['display-name'];
-    const texte = message.trim().replace(',', '.'); // Replace comma with dot for decimal numbers
-    const note = parseFloat(texte);
+    // Ignore messages sent by the bot itself to prevent infinite loops
+    if (self) return;
 
-    // Validate if it's a number, within the allowed range, and the user's first vote
-    if (!isNaN(note) && note >= 0 && note <= noteMax) {
-        if (!votes[pseudo]) {
-            votes[pseudo] = note; // Only the first submission is recorded
+    const cleanMessage = message.trim();
+    const username = tags['username'];
+    const displayName = tags['display-name'];
+
+    // 1. TRIGGER: Check if a streamer or mod starts a vote via "!note [timer] [max]"
+    if (cleanMessage.startsWith('!note')) {
+        // Only allow the broadcaster (streamer) or moderators to start a vote
+        const isMod = tags.mod || tags.badges?.broadcaster;
+        if (!isMod) return;
+
+        const args = cleanMessage.split(' ').slice(1);
+        const temps = parseInt(args[0]); // Timer in seconds
+        const max = parseInt(args[1]);   // Max score
+
+        // Validation
+        if (isNaN(temps) || isNaN(max)) {
+            client.say(channel, `⚠️ @${tags['display-name']} Erreur format: !note [timer] [max]. Exemple : !note 120 20`);
+            return;
         }
-    }
-});
 
-// Endpoint triggered by Wizebot's custom API call at the start of a vote
-app.get('/api/note', (req, res) => {
-    const argString = req.query.args || ""; 
-    const args = argString.split(' ');
-    
-    const temps = parseInt(args[0]); // Extracted timer duration in seconds
-    const max = parseInt(args[1]);   // Extracted maximum allowed score
+        if (voteActif) {
+            client.say(channel, `⚠️ Un vote est déjà en cours ! Veuillez patienter.`);
+            return;
+        }
 
-    // Input validation for arguments
-    if (isNaN(temps) || isNaN(max)) {
-        return res.send("Erreur format: !note [timer] [max]. Exemple : !note 120 20");
-    }
+        // Initialize voting state
+        voteActif = true;
+        noteMax = max;
+        votes = {};
 
-    // Prevent overlapping voting sessions
-    if (voteActif) {
-        return res.send("⚠️ Un vote est déjà en cours ! Veuillez patienter.");
-    }
+        console.log(`\n=== 📢 VOTE STARTED BY ${displayName} (${username}) ===`);
+        console.log(`Settings: Duration = ${temps}s, Max Score = ${max}`);
+        console.log(`=============================================\n`);
 
-    // Initialize the voting session parameters
-    voteActif = true;
-    noteMax = max;
-    votes = {};
+        // Announce the start of the vote
+        client.say(channel, `📢 Le vote est ouvert pour ${temps} secondes ! Envoyez votre note entre 0 et ${max} dans le chat (Seul votre premier vote compte).`);
 
-    // 1. Respond INSTANTLY to Wizebot to confirm the start and avoid connection timeout
-    res.send(`📢 Le vote est ouvert pour ${temps} secondes ! Envoyez votre note entre 0 et ${max} dans le chat (Seul votre premier vote compte).`);
+        // Start local background countdown
+        setTimeout(() => {
+            voteActif = false;
+            const pseudosVotants = Object.keys(votes);
+            const nombreDeVotes = pseudosVotants.length;
 
-    // 2. Start the countdown timer as a background task on Render
-    setTimeout(() => {
-        voteActif = false;
-        const pseudosVotants = Object.keys(votes);
-        const nombreDeVotes = pseudosVotants.length;
-        let messageFinal = "";
+            console.log(`\n=== VOTE FINISHED ===`);
+            console.log(`Total unique votes received: ${nombreDeVotes}`);
 
-        if (nombreDeVotes === 0) {
-            messageFinal = "Le vote est terminé ! Personne n'a voté, c'est quoi ces humains ?";
-        } else {
-            // Calculate the sum and the average score
-            let somme = 0;
-            for (let user of pseudosVotants) {
-                somme += votes[user];
+            if (nombreDeVotes === 0) {
+                console.log(`Stats: No votes registered.`);
+                console.log(`=======================\n`);
+                client.say(channel, "Le vote est terminé ! Personne n'a voté, c'est quoi ces humains ? ");
+            } else {
+                let somme = 0;
+                let noteMin = noteMax;
+                let noteMinUser = "";
+                let noteMaxReelle = 0;
+                let noteMaxUser = "";
+                const listNotes = [];
+
+                // Calculate basic stats and find min/max
+                for (let user of pseudosVotants) {
+                    const currentNote = votes[user];
+                    somme += currentNote;
+                    listNotes.push(currentNote);
+
+                    if (currentNote < noteMin) {
+                        noteMin = currentNote;
+                        noteMinUser = user;
+                    }
+                    if (currentNote >= noteMaxReelle) {
+                        noteMaxReelle = currentNote;
+                        noteMaxUser = user;
+                    }
+                }
+                
+                const moyenne = (somme / nombreDeVotes).toFixed(2);
+
+                // Advanced Stat: Standard Deviation (Écart-type)
+                const moyenneNum = somme / nombreDeVotes;
+                const variance = listNotes.reduce((acc, val) => acc + Math.pow(val - moyenneNum, 2), 0) / nombreDeVotes;
+                const ecartType = Math.sqrt(variance).toFixed(2);
+
+                // Print advanced stats only in console logs
+                console.log(`--- Advanced Stats ---`);
+                console.log(`• Average (Moyenne): ${moyenne} / ${noteMax}`);
+                console.log(`• Lowest Note (Min): ${noteMin} (by ${noteMinUser})`);
+                console.log(`• Highest Note (Max): ${noteMaxReelle} (by ${noteMaxUser})`);
+                console.log(`• Standard Deviation (Écart-type): ${ecartType}`);
+                console.log(`----------------------`);
+                console.log(`Full Votes List:`, votes);
+                console.log(`=======================\n`);
+
+                client.say(channel, `Le vote est terminé ! ${nombreDeVotes} votant(s). La moyenne est de : ${moyenne} / ${noteMax}`);
             }
-            const moyenne = (somme / nombreDeVotes).toFixed(2);
-            messageFinal = `Le vote est terminé ! ${nombreDeVotes} votant(s). La moyenne est de : ${moyenne} / ${noteMax}`;
-        }
-
-        // 3. Send the final results back to Wizebot via Push API to post it in the chat
-        envoyerPushWizebot(messageFinal);
-
-    }, temps * 1000);
-});
-
-// Function to send a Push Notification request to Wizebot
-function envoyerPushWizebot(texteAEnvoyer) {
-    // Safely retrieve credentials from Render's Environment Variables
-    const apiKey = process.env.WIZEBOT_API_KEY; 
-    const apiAccount = process.env.WIZEBOT_ACCOUNT;
-    
-    // Safety check in case environment variables are missing
-    if (!apiKey || !apiAccount) {
-        console.error("[Wizebot Push] Erreur : Les variables d'environnement ne sont pas configurées !");
-        return;
+        }, temps * 1000);
+        
+        return; // Stop processing this message as a score entry
     }
 
-    // Build the official Wizebot API URL using query parameters
-    const url = `https://wizebot.tv/api/push/${apiKey}/${apiAccount}/chat?message=${encodeURIComponent(texteAEnvoyer)}`;
+    // 2. SCORING PROCESS: Collect scores when a vote session is running
+    if (voteActif) {
+        const texte = cleanMessage.replace(',', '.');
+        const note = parseFloat(texte);
 
-    // Perform the HTTP GET request to Wizebot's servers
-    https.get(url, (response) => {
-        console.log(`[Wizebot Push] Message envoyé. Statut: ${response.statusCode}`);
-    }).on('error', (e) => {
-        console.error(`[Wizebot Push] Erreur: ${e.message}`);
-    });
-}
+        // Check if the message is a valid score and user hasn't voted yet
+        if (!isNaN(note) && note >= 0 && note <= noteMax) {
+            const pseudo = tags['display-name'];
+            if (!votes[pseudo]) {
+                votes[pseudo] = note;
+                console.log(`[VOTE SAVED] ${pseudo} (${username}) voted: ${note}`);
+            } else {
+                console.log(`[VOTE IGNORED] ${pseudo} (${username}) tried to vote again: ${note}`);
+            }
+        }
+    }
+});
 
-app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`));
+console.log(`[Local Bot] Application started. Listening to #${twitchChannel}...`);
