@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const tmi = require('tmi.js');
 
 const twitchChannel = process.env.TWITCH_CHANNEL || 'lucixxe';
